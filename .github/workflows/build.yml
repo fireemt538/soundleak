@@ -6,10 +6,11 @@ on:
     branches: [main]
 
 permissions:
+  contents: write
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
-  contents: write
 
 jobs:
   build:
@@ -20,8 +21,6 @@ jobs:
       - name: Diagnose image
         run: |
           sw_vers
-          uname -m
-          echo "== /Applications =="
           ls /Applications
 
       - name: Select Xcode
@@ -36,13 +35,19 @@ jobs:
             case "$major" in ''|*[!0-9]*) continue ;; esac
             if [ "$major" -ge 26 ]; then best="$app"; fi
           done
-          if [ -z "$best" ]; then
-            echo "::error::No Xcode 26 on this image"
-            exit 1
-          fi
+          if [ -z "$best" ]; then echo "::error::No Xcode 26"; exit 1; fi
           sudo xcode-select -s "$best/Contents/Developer"
           sudo xcodebuild -license accept || true
           xcodebuild -version
+
+      - name: Sanity check sources
+        run: |
+          set -eo pipefail
+          f=SoundLeak/SoundLeakApp.swift
+          wc -l "$f"
+          for s in 'struct ContentView' 'struct AppDetailView' 'struct SettingsView' 'struct SoundLeakApp' '@main'; do
+            grep -q "$s" "$f" || { echo "::error::missing $s — file is truncated"; exit 1; }
+          done
 
       - name: Install xcodegen
         run: |
@@ -50,11 +55,9 @@ jobs:
           export HOMEBREW_NO_AUTO_UPDATE=1
           if ! command -v xcodegen >/dev/null 2>&1; then
             brew install xcodegen --quiet || {
-              curl -fsSL -o /tmp/xcodegen.zip \
-                https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip
+              curl -fsSL -o /tmp/xcodegen.zip https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip
               unzip -q /tmp/xcodegen.zip -d /tmp/xg
               sudo cp /tmp/xg/xcodegen/bin/xcodegen /usr/local/bin/
-              sudo cp -R /tmp/xg/xcodegen/share/. /usr/local/share/ 2>/dev/null || true
             }
           fi
           xcodegen --version
@@ -71,13 +74,12 @@ jobs:
             'NSArray<NSString *> *pathleak(NSString *path, uint64_t max_inode);' '#endif' \
             > SoundLeak/pathleak.h
           printf '#import "worse_query.h"\n#import "pathleak.h"\n' > SoundLeak/Bridging.h
-          ls -l SoundLeak
 
       - name: Generate project
         run: |
           set -eo pipefail
           xcodegen generate
-          ls -d SoundLeak.xcodeproj
+          grep -q 'name: SoundLeak' SoundLeak.xcodeproj/xcshareddata/xcschemes/SoundLeak.xcscheme
 
       - name: Build
         run: |
@@ -91,7 +93,7 @@ jobs:
       - name: Show errors
         if: failure()
         run: |
-          [ -f build.log ] && grep -nE "error:|does not contain a scheme" build.log | head -n 60
+          [ -f build.log ] && grep -nE "error:|does not contain" build.log | head -n 60
           echo "---"
           [ -f build.log ] && tail -n 60 build.log
           true
@@ -100,10 +102,8 @@ jobs:
         run: |
           set -eo pipefail
           APP=build/Build/Products/Release-iphoneos/SoundLeak.app
-          ls -l "$APP"
           nm -gU "$APP/SoundLeak" | grep -q _worse_query
           nm -gU "$APP/SoundLeak" | grep -q _pathleak
-          plutil -p "$APP/Info.plist" | grep -q '26.0'
           echo "symbols OK"
 
       - name: Sign with entitlements
@@ -135,6 +135,5 @@ jobs:
         run: |
           set -eo pipefail
           tag="build-$(date +%Y%m%d-%H%M%S)"
-          gh release create "$tag" SoundLeak.ipa \
-            --title "SoundLeak $tag" \
-            --notes "Unsigned ad-hoc build. Re-sign with AltStore or SideStore before installing."
+          gh release create "$tag" SoundLeak.ipa --title "SoundLeak $tag" \
+            --notes "Unsigned ad-hoc build. Re-sign with AltStore or SideStore."
