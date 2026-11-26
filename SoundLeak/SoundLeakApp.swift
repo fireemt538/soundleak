@@ -19,11 +19,6 @@ enum WQ {
             FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: $0) != nil
         }
     }
-        candidates.append("group.cc.soundleak.app")
-        return candidates.first {
-            FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: $0) != nil
-        }
-    }
 
     static func consume(_ path: String, createDir: Bool = false) -> Int64 {
         guard let group else { return -1 }
