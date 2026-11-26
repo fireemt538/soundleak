@@ -537,7 +537,7 @@ struct AppDetailView: View {
         .alert("Import", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
             Button("OK") { message = nil }
         } message: { Text(message ?? "") }
-        .sheet(item: $export) { item in
+.sheet(item: $export) { item in
             NavigationStack {
                 VStack(spacing: 20) {
                     ShareLink(item: item.url) { Label("Save or share", systemImage: "square.and.arrow.up") }
@@ -545,4 +545,51 @@ struct AppDetailView: View {
                 }
                 .padding()
                 .navigationTitle(item.url.lastPathComponent)
-                .navigationBarTitleDisplay
+                .navigationBarTitleDisplayMode(.inline)
+            }
+        }
+        .onDisappear { previewer.stop() }
+    }
+}
+
+struct SettingsView: View {
+    @ObservedObject var store: Store
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Scan") {
+                    VStack(alignment: .leading) {
+                        Text("Inode ceiling ×\(store.thorough, specifier: "%.1f")")
+                        Slider(value: $store.thorough, in: 1...6, step: 0.5)
+                    }
+                    Toggle("Include apps without a sounds folder", isOn: $store.includeCreatable)
+                }
+                Section("Diagnostics") {
+                    Button("Probe all roots") { store.diagnose() }
+                }
+                Section("Environment") {
+                    LabeledContent("App Group", value: WQ.group ?? "none")
+                    LabeledContent("iOS", value: ProcessInfo.processInfo.operatingSystemVersionString)
+                }
+                Section("Log") {
+                    ScrollView {
+                        Text(store.log.suffix(200).joined(separator: "\n"))
+                            .font(.system(.caption2, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(height: 200)
+                }
+            }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } } }
+        }
+    }
+}
+
+@main
+struct SoundLeakApp: App {
+    var body: some Scene { WindowGroup { ContentView() } }
+}
