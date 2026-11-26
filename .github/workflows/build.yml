@@ -78,11 +78,20 @@ jobs:
 
       - name: Build
         run: |
-          set -eo pipefail
+          set -o pipefail
           xcodebuild -project SoundLeak.xcodeproj -scheme SoundLeak \
             -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
             -derivedDataPath build \
-            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tee build.log | tail -n 120
+
+      - name: Show errors
+        if: failure()
+        run: |
+          [ -f build.log ] && grep -nE "error:|does not contain a scheme" build.log | head -n 60
+          echo "---"
+          [ -f build.log ] && tail -n 60 build.log
+          true
 
       - name: Verify binary
         run: |
