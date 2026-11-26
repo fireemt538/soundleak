@@ -25,7 +25,9 @@ jobs:
           curl -fsSL "$B/worse_query.m" -o SoundLeak/worse_query.m
           curl -fsSL "$B/pathleak.m" -o SoundLeak/pathleak.m
           printf '%s\n' '#ifndef pathleak_h' '#define pathleak_h' '#import <Foundation/Foundation.h>' '#include <stdint.h>' 'NSArray<NSString *> *pathleak(NSString *path, uint64_t max_inode);' '#endif' > SoundLeak/pathleak.h
-          printf '#import "worse_query.h"\n#import "pathleak.h"\n' > SoundLeak/Bridging.h
+          printf '%s\n' '#import <Foundation/Foundation.h>' 'NSArray<NSString *> *WQAppGroups(void);' > SoundLeak/entitlements.h
+          printf '%s\n' '#import <Foundation/Foundation.h>' '#import <Security/Security.h>' 'NSArray<NSString *> *WQAppGroups(void) {' '    extern void *SecTaskCreateFromSelf(CFAllocatorRef);' '    extern CFTypeRef SecTaskCopyValueForEntitlement(void *, CFStringRef, CFErrorRef *);' '    void *task = SecTaskCreateFromSelf(NULL);' '    if (!task) return @[];' '    CFTypeRef v = SecTaskCopyValueForEntitlement(task, CFSTR("com.apple.security.application-groups"), NULL);' '    if (!v) return @[];' '    NSArray *a = (__bridge_transfer NSArray *)v;' '    return [a isKindOfClass:[NSArray class]] ? a : @[];' '}' > SoundLeak/entitlements.m
+          printf '#import "worse_query.h"\n#import "pathleak.h"\n#import "entitlements.h"\n' > SoundLeak/Bridging.h
           wc -l SoundLeak/SoundLeakApp.swift
           grep -q 'struct AppDetailView' SoundLeak/SoundLeakApp.swift || { echo "::error::swift file truncated"; exit 1; }
           xcodegen generate
