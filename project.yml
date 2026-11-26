@@ -9,6 +9,8 @@ targets:
     type: application
     platform: iOS
     sources: [SoundLeak]
+    scheme:
+      testTargets: []
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: cc.soundleak.app
