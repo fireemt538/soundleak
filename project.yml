@@ -9,6 +9,8 @@ targets:
     type: application
     platform: iOS
     sources: [SoundLeak]
+    dependencies:
+      - sdk: Security.framework
     scheme:
       testTargets: []
     settings:
