@@ -343,4 +343,190 @@ struct ContentView: View {
                     List {
                         if store.scanning {
                             Section {
-                                HStack(spacing: 12) {
+                                HStack(spacing: 12) {ProgressView()
+                                    Text(store.status).font(.footnote).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        ForEach(filtered) { hit in
+                            NavigationLink { AppDetailView(store: store, hit: hit) } label: { row(hit) }
+                        }
+                    }
+                    .listStyle(.plain)
+                }
+            }
+            .navigationTitle("SoundLeak")
+            .searchable(text: $query, prompt: "Filter apps or files")
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { showSettings = true } label: { Image(systemName: "slider.horizontal.3") }
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    if store.scanning {
+                        Button("Cancel") { store.cancel() }
+                    } else {
+                        Button { store.scan() } label: { Image(systemName: "arrow.clockwise") }
+                    }
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                HStack {
+                    Text(store.scanning ? "\(store.scanned) scanned" : store.status)
+                        .font(.caption2).foregroundStyle(.secondary)
+                    Spacer()
+                    Text("\(store.apps.count) apps").font(.caption2).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal).padding(.vertical, 6).background(.bar)
+            }
+            .sheet(isPresented: $showSettings) { SettingsView(store: store) }
+            .task { store.bootstrap() }
+        }
+    }
+
+    private func row(_ hit: AppHit) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: hit.hasSoundsDir ? "bell.badge" : "bell")
+                .foregroundStyle(hit.hasSoundsDir ? Color.accentColor : .secondary)
+                .frame(width: 26)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(hit.displayName).font(.body.weight(.medium))
+                Text(hit.bundleID).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer()
+            Text(hit.hasSoundsDir ? "\(hit.files.count)" : "—")
+                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            if hit.writeVerified {
+                Image(systemName: "checkmark.seal.fill").foregroundStyle(.green).font(.caption)
+            }
+        }
+    }
+}
+
+private struct ExportItem: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+struct AppDetailView: View {
+    @ObservedObject var store: Store
+    let hit: AppHit
+    @StateObject private var previewer = Previewer.shared
+    @State private var importing = false
+    @State private var message: String?
+    @State private var export: ExportItem?
+
+    private var current: AppHit {
+        store.apps.first { $0.containerPath == hit.containerPath } ?? hit
+    }
+
+    var body: some View {
+        List {
+            Section("App") {
+                LabeledContent("Bundle", value: current.bundleID)
+                LabeledContent("Editable", value: current.writeVerified ? "Yes" : "Read-only")
+                LabeledContent("Writable sounds", value: "\(current.editableCount)")
+            }
+            if !current.hasSoundsDir {
+                Section { Button("Create Library/Sounds") { store.makeSoundsDir(for: current) } }
+            }
+            Section("Sounds") {
+                if current.files.isEmpty { Text("Empty").foregroundStyle(.secondary) }
+                ForEach(current.files) { file in
+                    HStack(spacing: 12) {
+                        Button { previewer.toggle(file, container: current.containerPath) } label: {
+                            Image(systemName: previewer.playing == file.path ? "stop.fill" : "play.fill")
+                        }
+                        .buttonStyle(.borderless)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(file.name).font(.callout).lineLimit(1)
+                            HStack(spacing: 6) {
+                                Text(file.sizeText)
+                                Text(file.ext)
+                                if !file.systemPlayable { Text("unplayable").foregroundStyle(.orange) }
+                                if !file.writable { Text("locked").foregroundStyle(.red) }
+                            }
+                            .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button {
+                            if let url = store.export(file, from: current) {
+                                export = ExportItem(url: url)
+                            }
+                        } label: { Image(systemName: "square.and.arrow.up") }
+                        .buttonStyle(.borderless)
+                    }
+                    .swipeActions {
+                        Button(role: .destructive) { store.delete(file, in: current) } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle(current.displayName)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button { importing = true } label: { Image(systemName: "plus") }
+            }
+        }
+        .fileImporter(isPresented: $importing, allowedContentTypes: [.audio], allowsMultipleSelection: false) { r in
+            guard case .success(let urls) = r, let url = urls.first else { return }
+            message = store.importSound(from: url, into: current)
+        }
+        .alert("Import", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
+            Button("OK") { message = nil }
+        } message: { Text(message ?? "") }
+        .sheet(item: $export) { item in
+            NavigationStack {
+                VStack(spacing: 20) {
+                    ShareLink(item: item.url) { Label("Save or share", systemImage: "square.and.arrow.up") }
+                    Spacer()
+                }
+                .padding()
+                .navigationTitle(item.url.lastPathComponent)
+                .navigationBarTitleDisplayMode(.inline)
+            }
+        }
+        .onDisappear { previewer.stop() }
+    }
+}
+
+struct SettingsView: View {
+    @ObservedObject var store: Store
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Scan") {
+                    VStack(alignment: .leading) {
+                        Text("Inode ceiling ×\(store.thorough, specifier: "%.1f")")
+                        Slider(value: $store.thorough, in: 1...6, step: 0.5)
+                    }
+                    Toggle("Include apps without a sounds folder", isOn: $store.includeCreatable)
+                }
+                Section("Environment") {
+                    LabeledContent("App Group", value: WQ.group ?? "none")
+                    LabeledContent("iOS", value: ProcessInfo.processInfo.operatingSystemVersionString)
+                }
+                Section("Log") {
+                    ScrollView {
+                        Text(store.log.suffix(200).joined(separator: "\n"))
+                            .font(.system(.caption2, design: .monospaced))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(height: 200)
+                }
+            }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } } }
+        }
+    }
+}
+
+@main
+struct SoundLeakApp: App {
+    var body: some Scene { WindowGroup { ContentView() } }
+}
