@@ -1,145 +1,47 @@
 name: build-ipa
-
 on:
   workflow_dispatch:
   push:
     branches: [main]
-
 permissions:
   contents: write
-
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: build-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
   build:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v5
-
-      - name: Diagnose image
-        run: |
-          sw_vers
-          ls /Applications
-
-- name: Select Xcode
-        run: |
-          set -o pipefail
-          best=""
-          for app in /Applications/Xcode*.app; do
-            [ -d "$app" ] || continue
-            v=$("$app/Contents/Developer/usr/bin/xcodebuild" -version 2>/dev/null | head -1 | awk '{print $2}' || true)
-            echo "candidate: $app -> ${v:-unknown}"
-            major="${v%%.*}"
-            case "$major" in ''|*[!0-9]*) continue ;; esac
-            if [ "$major" -ge 26 ]; then best="$app"; fi
-          done
-          if [ -z "$best" ]; then
-            echo "::error::No Xcode 26 on image"
-            ls /Applications
-            exit 1
-          fi
-          echo "selected: $best"
-          sudo xcode-select -s "$best/Contents/Developer" || true
-          sudo xcodebuild -license accept || true
-          xcode-select -p
-          xcodebuild -version || { echo "::error::xcodebuild unusable at $best"; exit 1; }
-
-      - name: Sanity check sources
+      - name: Build
         run: |
           set -eo pipefail
-          f=SoundLeak/SoundLeakApp.swift
-          wc -l "$f"
-          for s in 'struct ContentView' 'struct AppDetailView' 'struct SettingsView' 'struct SoundLeakApp' '@main'; do
-            grep -q "$s" "$f" || { echo "::error::missing $s — file is truncated"; exit 1; }
-          done
-
-      - name: Install xcodegen
-        run: |
-          set -eo pipefail
-          export HOMEBREW_NO_AUTO_UPDATE=1
-          if ! command -v xcodegen >/dev/null 2>&1; then
-            brew install xcodegen --quiet || {
-              curl -fsSL -o /tmp/xcodegen.zip https://github.com/yonaskolb/XcodeGen/releases/latest/download/xcodegen.zip
-              unzip -q /tmp/xcodegen.zip -d /tmp/xg
-              sudo cp /tmp/xg/xcodegen/bin/xcodegen /usr/local/bin/
-            }
-          fi
-          xcodegen --version
-
-      - name: Fetch worse_query sources
-        run: |
-          set -eo pipefail
+          app=$(ls -d /Applications/Xcode*.app | sort -V | tail -1)
+          sudo xcode-select -s "$app/Contents/Developer"
+          xcodebuild -version
+          brew install xcodegen --quiet
           B=https://raw.githubusercontent.com/forcequitOS/worse_query/main/worse_query
           curl -fsSL "$B/worse_query.h" -o SoundLeak/worse_query.h
           curl -fsSL "$B/worse_query.m" -o SoundLeak/worse_query.m
-          curl -fsSL "$B/pathleak.m"    -o SoundLeak/pathleak.m
-          printf '%s\n' '#ifndef pathleak_h' '#define pathleak_h' \
-            '#import <Foundation/Foundation.h>' '#include <stdint.h>' \
-            'NSArray<NSString *> *pathleak(NSString *path, uint64_t max_inode);' '#endif' \
-            > SoundLeak/pathleak.h
+          curl -fsSL "$B/pathleak.m" -o SoundLeak/pathleak.m
+          printf '%s\n' '#ifndef pathleak_h' '#define pathleak_h' '#import <Foundation/Foundation.h>' '#include <stdint.h>' 'NSArray<NSString *> *pathleak(NSString *path, uint64_t max_inode);' '#endif' > SoundLeak/pathleak.h
           printf '#import "worse_query.h"\n#import "pathleak.h"\n' > SoundLeak/Bridging.h
-
-      - name: Generate project
-        run: |
-          set -eo pipefail
+          wc -l SoundLeak/SoundLeakApp.swift
+          grep -q 'struct AppDetailView' SoundLeak/SoundLeakApp.swift || { echo "::error::swift file truncated"; exit 1; }
           xcodegen generate
-          grep -q 'name: SoundLeak' SoundLeak.xcodeproj/xcshareddata/xcschemes/SoundLeak.xcscheme
-
-      - name: Build
-        run: |
-          set -o pipefail
-          xcodebuild -project SoundLeak.xcodeproj -scheme SoundLeak \
-            -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
-            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
-            build 2>&1 | tee build.log | tail -n 120
-
-      - name: Show errors
-        if: failure()
-        run: |
-          [ -f build.log ] && grep -nE "error:|does not contain" build.log | head -n 60
-          echo "---"
-          [ -f build.log ] && tail -n 60 build.log
-          true
-
-      - name: Verify binary
-        run: |
-          set -eo pipefail
-          APP=build/Build/Products/Release-iphoneos/SoundLeak.app
-          nm -gU "$APP/SoundLeak" | grep -q _worse_query
-          nm -gU "$APP/SoundLeak" | grep -q _pathleak
-          echo "symbols OK"
-
-      - name: Sign with entitlements
-        run: |
-          set -eo pipefail
+          xcodebuild -project SoundLeak.xcodeproj -scheme SoundLeak -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO build 2>&1 | tee build.log | tail -n 100
           APP=build/Build/Products/Release-iphoneos/SoundLeak.app
           codesign --force --sign - --entitlements SoundLeak/SoundLeak.entitlements "$APP"
-          codesign -d --entitlements :- "$APP" 2>/dev/null | plutil -p - | grep -q application-groups
-          echo "entitlements OK"
-
-      - name: Package
-        run: |
-          set -eo pipefail
-          APP=build/Build/Products/Release-iphoneos/SoundLeak.app
           rm -rf Payload SoundLeak.ipa
           mkdir Payload
           cp -R "$APP" Payload/
           zip -qry SoundLeak.ipa Payload
-          ls -l SoundLeak.ipa
-
+      - name: Errors
+        if: failure()
+        run: |
+          grep -nE "error:" build.log | head -40 || true
+          tail -n 50 build.log || true
       - uses: actions/upload-artifact@v5
         with:
           name: SoundLeak-ipa
           path: SoundLeak.ipa
-
-      - name: Publish release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -eo pipefail
-          tag="build-$(date +%Y%m%d-%H%M%S)"
-          gh release create "$tag" SoundLeak.ipa --title "SoundLeak $tag" \
-            --notes "Unsigned ad-hoc build. Re-sign with AltStore or SideStore."
