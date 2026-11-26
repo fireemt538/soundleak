@@ -13,12 +13,12 @@ enum WQ {
     static var group: String?
 
     static func resolveGroup() -> String? {
-        var candidates: [String] = []
-        if let task = SecTaskCreateFromSelf(nil),
-           let raw = SecTaskCopyValueForEntitlement(task, "com.apple.security.application-groups" as CFString, nil),
-           let list = raw as? [String] {
-            candidates = list
+        var candidates = WQAppGroups() ?? []
+        candidates.append("group.cc.soundleak.app")
+        return candidates.first {
+            FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: $0) != nil
         }
+    }
         candidates.append("group.cc.soundleak.app")
         return candidates.first {
             FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: $0) != nil
