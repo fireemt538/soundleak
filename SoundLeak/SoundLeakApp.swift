@@ -14,18 +14,39 @@ enum WQ {
 
     static func resolveGroup() -> String? {
         var candidates = WQAppGroups() ?? []
-        candidates.append("group.cc.soundleak.app")
-        return candidates.first {
-            FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: $0) != nil
+        if let bid = Bundle.main.bundleIdentifier {
+            candidates.append("group." + bid)
         }
+        candidates.append("group.cc.soundleak.app")
+
+        var seen = Set<String>()
+        var existing: [String] = []
+        for g in candidates where seen.insert(g).inserted {
+            if FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: g) != nil {
+                existing.append(g)
+            }
+        }
+        guard !existing.isEmpty else { return nil }
+
+        let is26 = ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 26
+        for g in existing {
+            guard let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: g) else { continue }
+            try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            let probe = worse_query(url.path, g, is26, false)
+            if probe > 0 {
+                worse_query_release(probe)
+                return g
+            }
+        }
+        return existing.first
     }
 
-    static func consume(_ path: String, createDir: Bool = false) -> Int64 {
+    static func consume(_ path: String, alt: Bool? = nil, createDir: Bool = false) -> Int64 {
         guard let group else { return -1 }
-        let isGroupPath = path.contains("/var/mobile/Containers/Shared/AppGroup")
+        let isGroupPath = path.contains("/Containers/Shared/AppGroup")
         let is26 = ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 26
-        let alt = isGroupPath && is26
-        return worse_query(path, group, alt, createDir)
+        let useAlt = alt ?? (isGroupPath && is26)
+        return worse_query(path, group, useAlt, createDir)
     }
 
     static func release(_ handle: Int64) { if handle > 0 { worse_query_release(handle) } }
@@ -78,6 +99,17 @@ struct AppHit: Identifiable, Hashable {
 
 @MainActor
 final class Store: ObservableObject {
+    static let roots: [(String, Bool)] = [
+        ("/private/var/mobile/Containers/Data/Application", false),
+        ("/private/var/mobile/Containers/Data/Application", true),
+        ("/var/mobile/Containers/Data/Application", false),
+        ("/var/mobile/Containers/Data/Application", true),
+        ("/private/var/mobile/Containers/Data/PluginKitPlugin", false),
+        ("/private/var/mobile/Containers/Data/PluginKitPlugin", true),
+        ("/private/var/mobile/Containers/Shared/AppGroup", false),
+        ("/private/var/mobile/Containers/Shared/AppGroup", true)
+    ]
+
     @Published var apps: [AppHit] = []
     @Published var scanning = false
     @Published var status = "Idle"
@@ -94,8 +126,11 @@ final class Store: ObservableObject {
 
     func bootstrap() {
         WQ.group = WQ.resolveGroup()
-        if WQ.group == nil {
-            fatal = "No App Group. Re-sign with AltStore or SideStore so one gets provisioned."
+        guard WQ.group == nil else { return }
+        if (WQAppGroups() ?? []).isEmpty {
+            fatal = "Your signer provisioned no App Group. Reinstall through AltStore or SideStore, or use a paid account with an explicit App ID."
+        } else {
+            fatal = "App Group exists but no token was issued. Reboot the phone and reopen."
         }
     }
 
@@ -113,20 +148,18 @@ final class Store: ObservableObject {
 
     func cancel() { cancelled = true; status = "Cancelling…" }
 
+    func diagnose() {
+        log.append("group: \(WQ.group ?? "none")")
+        for (root, alt) in Store.roots {
+            let h = WQ.consume(root, alt: alt)
+            log.append("\(root) alt=\(alt ? 1 : 0) -> \(h)")
+            WQ.release(h)
+        }
+    }
+
     private nonisolated func performScan(thorough: Double, includeCreatable: Bool) {
         func report(_ s: String) { Task { @MainActor in self.status = s } }
         func note(_ s: String) { Task { @MainActor in self.log.append(s) } }
-
-        let root = containerRoot
-        let rootHandle = WQ.consume(root)
-        guard rootHandle > 0 else {
-            Task { @MainActor in
-                self.scanning = false
-                self.fatal = "worse_query failed on the container root (handle \(rootHandle))."
-            }
-            return
-        }
-        defer { WQ.release(rootHandle) }
 
         let baseline = FileManager.default.temporaryDirectory
             .appendingPathComponent(".bl_\(UUID().uuidString)")
@@ -140,9 +173,40 @@ final class Store: ObservableObject {
         }
         note("inode ceiling \(ceiling)")
 
-        report("Leaking container paths…")
-        let paths = pathleak(root, ceiling) ?? []
-        note("\(paths.count) candidates")
+        var paths: [String] = []
+        var chosenAlt = false
+
+        for (root, alt) in Store.roots {
+            if cancelled { break }
+            report("Probing \(root)…")
+            let h = WQ.consume(root, alt: alt)
+            note("root \(root) alt=\(alt ? 1 : 0) -> \(h)")
+            if h > 0 {
+                let found = pathleak(root, ceiling) ?? []
+                note("  found \(found.count)")
+                WQ.release(h)
+                if !found.isEmpty {
+                    paths = found
+                    chosenAlt = alt
+                    break
+                }
+            }
+        }
+
+        if paths.isEmpty && !cancelled {
+            note("no root handle worked; trying pathleak without extension")
+            paths = pathleak(containerRoot, ceiling) ?? []
+            note("  fallback found \(paths.count)")
+        }
+
+        guard !paths.isEmpty else {
+            Task { @MainActor in
+                self.scanning = false
+                self.status = "No paths found — open Log for handle codes"
+            }
+            return
+        }
+        note("using \(paths.count) paths, alt=\(chosenAlt ? 1 : 0)")
 
         var hits: [AppHit] = []
         let own = Bundle.main.bundleIdentifier
@@ -153,7 +217,7 @@ final class Store: ObservableObject {
                 report("Inspecting \(i)/\(paths.count)…")
                 Task { @MainActor in self.scanned = i }
             }
-            let handle = WQ.consume(path)
+            let handle = WQ.consume(path, alt: chosenAlt)
             guard handle > 0 else { continue }
             defer { WQ.release(handle) }
             guard let bid = WQ.bundleID(at: path), bid != own else { continue }
@@ -338,7 +402,8 @@ struct ContentView: View {
                     List {
                         if store.scanning {
                             Section {
-                                HStack(spacing: 12) {ProgressView()
+                                HStack(spacing: 12) {
+                                    ProgressView()
                                     Text(store.status).font(.footnote).foregroundStyle(.secondary)
                                 }
                             }
@@ -480,48 +545,4 @@ struct AppDetailView: View {
                 }
                 .padding()
                 .navigationTitle(item.url.lastPathComponent)
-                .navigationBarTitleDisplayMode(.inline)
-            }
-        }
-        .onDisappear { previewer.stop() }
-    }
-}
-
-struct SettingsView: View {
-    @ObservedObject var store: Store
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Scan") {
-                    VStack(alignment: .leading) {
-                        Text("Inode ceiling ×\(store.thorough, specifier: "%.1f")")
-                        Slider(value: $store.thorough, in: 1...6, step: 0.5)
-                    }
-                    Toggle("Include apps without a sounds folder", isOn: $store.includeCreatable)
-                }
-                Section("Environment") {
-                    LabeledContent("App Group", value: WQ.group ?? "none")
-                    LabeledContent("iOS", value: ProcessInfo.processInfo.operatingSystemVersionString)
-                }
-                Section("Log") {
-                    ScrollView {
-                        Text(store.log.suffix(200).joined(separator: "\n"))
-                            .font(.system(.caption2, design: .monospaced))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .frame(height: 200)
-                }
-            }
-            .navigationTitle("Settings")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .topBarTrailing) { Button("Done") { dismiss() } } }
-        }
-    }
-}
-
-@main
-struct SoundLeakApp: App {
-    var body: some Scene { WindowGroup { ContentView() } }
-}
+                .navigationBarTitleDisplay
