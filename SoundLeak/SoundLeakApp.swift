@@ -2,10 +2,22 @@ import SwiftUI
 import AVFoundation
 import Security
 import UniformTypeIdentifiers
+import Darwin
 
 // MARK: - Constants
 
 let containerRoot = "/var/mobile/Containers/Data/Application"
+
+let allRoots: [(String, Bool)] = [
+    ("/private/var/mobile/Containers/Data/Application", false),
+    ("/private/var/mobile/Containers/Data/Application", true),
+    ("/var/mobile/Containers/Data/Application", false),
+    ("/var/mobile/Containers/Data/Application", true),
+    ("/private/var/mobile/Containers/Data/PluginKitPlugin", false),
+    ("/private/var/mobile/Containers/Data/PluginKitPlugin", true),
+    ("/private/var/mobile/Containers/Shared/AppGroup", false),
+    ("/private/var/mobile/Containers/Shared/AppGroup", true)
+]
 
 // MARK: - worse_query bridge
 
@@ -99,17 +111,6 @@ struct AppHit: Identifiable, Hashable {
 
 @MainActor
 final class Store: ObservableObject {
-    static let roots: [(String, Bool)] = [
-        ("/private/var/mobile/Containers/Data/Application", false),
-        ("/private/var/mobile/Containers/Data/Application", true),
-        ("/var/mobile/Containers/Data/Application", false),
-        ("/var/mobile/Containers/Data/Application", true),
-        ("/private/var/mobile/Containers/Data/PluginKitPlugin", false),
-        ("/private/var/mobile/Containers/Data/PluginKitPlugin", true),
-        ("/private/var/mobile/Containers/Shared/AppGroup", false),
-        ("/private/var/mobile/Containers/Shared/AppGroup", true)
-    ]
-
     @Published var apps: [AppHit] = []
     @Published var scanning = false
     @Published var status = "Idle"
@@ -150,11 +151,45 @@ final class Store: ObservableObject {
 
     func diagnose() {
         log.append("group: \(WQ.group ?? "none")")
-        for (root, alt) in Store.roots {
-            let h = WQ.consume(root, alt: alt)
-            log.append("\(root) alt=\(alt ? 1 : 0) -> \(h)")
+        if let g = WQ.group,
+           let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: g) {
+            try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            let h = WQ.consume(url.path, alt: false)
+            log.append("group container -> \(h)")
             WQ.release(h)
         }
+        var sfs = statfs()
+        log.append("statfs /private/var -> \(statfs("/private/var", &sfs))")
+    }
+
+    private nonisolated func sweep(prefix: String,
+                                   ceiling: UInt64,
+                                   progress: (Int) -> Void) -> [String] {
+        var sfs = statfs()
+        guard statfs("/private/var", &sfs) == 0 else { return [] }
+        var fsid = sfs.f_fsid
+        let plen = prefix.utf8.count
+        let pchars = Array(prefix.utf8CString)
+        var buf = [CChar](repeating: 0, count: 4096)
+        var out: [String] = []
+
+        for inode in 1...ceiling {
+            if cancelled { break }
+            if inode % 250_000 == 0 { progress(Int(inode)) }
+            let n = fsgetpath(&buf, 4095, &fsid, inode)
+            guard n > 0 else { continue }
+            if strncmp(buf, pchars, plen) != 0 { continue }
+            if buf[plen] != 47 { continue }
+            var i = plen + 1
+            var nested = false
+            while buf[i] != 0 {
+                if buf[i] == 47 { nested = true; break }
+                i += 1
+            }
+            if nested { continue }
+            if let s = String(validatingUTF8: buf) { out.append(s) }
+        }
+        return out
     }
 
     private nonisolated func performScan(thorough: Double, includeCreatable: Bool) {
@@ -163,7 +198,7 @@ final class Store: ObservableObject {
 
         let baseline = FileManager.default.temporaryDirectory
             .appendingPathComponent(".bl_\(UUID().uuidString)")
-        var ceiling: UInt64 = 2_000_000
+        var ceiling: UInt64 = 4_000_000
         if (try? Data("p".utf8).write(to: baseline)) != nil {
             var st = stat()
             if stat(baseline.path, &st) == 0, st.st_ino > 0 {
@@ -173,40 +208,26 @@ final class Store: ObservableObject {
         }
         note("inode ceiling \(ceiling)")
 
-        var paths: [String] = []
-        var chosenAlt = false
-
-        for (root, alt) in Store.roots {
-            if cancelled { break }
-            report("Probing \(root)…")
+        for (root, alt) in allRoots {
             let h = WQ.consume(root, alt: alt)
             note("root \(root) alt=\(alt ? 1 : 0) -> \(h)")
-            if h > 0 {
-                let found = pathleak(root, ceiling) ?? []
-                note("  found \(found.count)")
-                WQ.release(h)
-                if !found.isEmpty {
-                    paths = found
-                    chosenAlt = alt
-                    break
-                }
-            }
+            WQ.release(h)
         }
 
-        if paths.isEmpty && !cancelled {
-            note("no root handle worked; trying pathleak without extension")
-            paths = pathleak(containerRoot, ceiling) ?? []
-            note("  fallback found \(paths.count)")
+        let prefix = "/private/var/mobile/Containers/Data/Application"
+        report("Sweeping inodes…")
+        let paths = sweep(prefix: prefix, ceiling: ceiling) { done in
+            report("Sweeping \(done) / \(ceiling)…")
         }
+        note("swept \(paths.count) containers")
 
         guard !paths.isEmpty else {
             Task { @MainActor in
                 self.scanning = false
-                self.status = "No paths found — open Log for handle codes"
+                self.status = "Sweep found nothing — see Log"
             }
             return
         }
-        note("using \(paths.count) paths, alt=\(chosenAlt ? 1 : 0)")
 
         var hits: [AppHit] = []
         let own = Bundle.main.bundleIdentifier
@@ -217,7 +238,8 @@ final class Store: ObservableObject {
                 report("Inspecting \(i)/\(paths.count)…")
                 Task { @MainActor in self.scanned = i }
             }
-            let handle = WQ.consume(path, alt: chosenAlt)
+            var handle = WQ.consume(path, alt: false)
+            if handle <= 0 { handle = WQ.consume(path, alt: true) }
             guard handle > 0 else { continue }
             defer { WQ.release(handle) }
             guard let bid = WQ.bundleID(at: path), bid != own else { continue }
@@ -537,7 +559,7 @@ struct AppDetailView: View {
         .alert("Import", isPresented: Binding(get: { message != nil }, set: { if !$0 { message = nil } })) {
             Button("OK") { message = nil }
         } message: { Text(message ?? "") }
-.sheet(item: $export) { item in
+        .sheet(item: $export) { item in
             NavigationStack {
                 VStack(spacing: 20) {
                     ShareLink(item: item.url) { Label("Save or share", systemImage: "square.and.arrow.up") }
